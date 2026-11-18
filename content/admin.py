@@ -1,10 +1,10 @@
-"""apps/content/admin.py — nécessite Django 3.2+ (décorateurs admin.display / admin.action)."""
+"""content/admin.py — version Item / Translation / Course. Nécessite Django 3.2+ (décorateurs admin.display / admin.action)."""
 from django.contrib import admin
 from django.utils import timezone
 
 from .models import (
-    Attempt, Badge, Contribution, DataSource, Exercise, Language, Lesson,
-    MasterPhrase, PointEvent, Profile, Report, ReviewCard, SourceSentence,
+    Attempt, Badge, Contribution, Course, DataSource, Exercise, Item, Language,
+    Lesson, MasterPhrase, PointEvent, Profile, Report, ReviewCard,
     Theme, Translation, UserBadge, UserProgress,
 )
 
@@ -56,26 +56,36 @@ class TranslationInline(admin.TabularInline):
     raw_id_fields = ("data_source",)
 
 
-@admin.register(SourceSentence)
-class SourceSentenceAdmin(admin.ModelAdmin):
-    list_display = ("id", "arabic_short", "theme", "unit_type", "word_count", "difficulty")
-    list_filter = ("theme", "unit_type", "difficulty")
-    search_fields = ("arabic_text",)
+@admin.register(Course)
+class CourseAdmin(admin.ModelAdmin):
+    list_display = ("title", "prompt_language", "target_language", "is_active")
+    list_editable = ("is_active",)
+    list_select_related = ("prompt_language", "target_language")
+
+
+@admin.register(Item)
+class ItemAdmin(admin.ModelAdmin):
+    list_display = ("id", "master_ref", "texts", "unit_type", "difficulty", "theme", "needs_review")
+    list_filter = ("unit_type", "needs_review", "difficulty", "theme")
+    search_fields = ("master_ref", "translations__text")
     list_select_related = ("theme",)
     inlines = [TranslationInline]
 
-    @admin.display(description="Texte arabe")
-    def arabic_short(self, obj):
-        return _short(obj.arabic_text)
+    def get_queryset(self, request):
+        return super().get_queryset(request).prefetch_related("translations__language")
+
+    @admin.display(description="Textes (langue : texte)")
+    def texts(self, obj):
+        return " | ".join(f"{t.language.code}: {_short(t.text, 30)}" for t in obj.translations.all())
 
 
 @admin.register(Translation)
 class TranslationAdmin(admin.ModelAdmin):
     list_display = ("id", "language", "text_short", "status", "data_source", "updated_at")
     list_filter = ("language", "status")
-    search_fields = ("text", "source__arabic_text")
+    search_fields = ("text", "item__master_ref")
     list_select_related = ("language", "data_source")
-    raw_id_fields = ("source", "data_source")
+    raw_id_fields = ("item", "data_source")
     actions = ["mark_validated", "mark_flagged", "mark_raw"]
 
     @admin.display(description="Texte")
@@ -104,25 +114,31 @@ class TranslationAdmin(admin.ModelAdmin):
 class ExerciseInline(admin.TabularInline):
     model = Exercise
     extra = 0
-    fields = ("position", "exercise_type", "translation")
-    raw_id_fields = ("translation",)
+    fields = ("position", "exercise_type", "item")
+    raw_id_fields = ("item",)
 
 
 @admin.register(Lesson)
 class LessonAdmin(admin.ModelAdmin):
-    list_display = ("title", "language", "theme", "level", "position", "is_published")
-    list_filter = ("language", "theme", "is_published", "level")
+    list_display = ("title", "course", "theme", "level", "position", "is_published")
+    list_filter = ("course", "theme", "is_published", "level")
     search_fields = ("title",)
-    list_select_related = ("language", "theme")
+    list_select_related = ("course", "theme")
     inlines = [ExerciseInline]
     actions = ["publish_lessons", "unpublish_lessons"]
 
     @admin.action(description="Publier (si toutes les traductions sont validées)")
     def publish_lessons(self, request, queryset):
         done, refused = 0, 0
-        for lesson in queryset.prefetch_related("exercises__translation"):
+        for lesson in queryset.select_related("course").prefetch_related("exercises__item__translations"):
             exercises = list(lesson.exercises.all())
-            if exercises and all(e.translation.status == Translation.Status.VALIDATED for e in exercises):
+            target_id = lesson.course.target_language_id
+
+            def has_validated_target(exercise):
+                return any(t.language_id == target_id and t.status == Translation.Status.VALIDATED
+                           for t in exercise.item.translations.all())
+
+            if exercises and all(has_validated_target(e) for e in exercises):
                 lesson.is_published = True
                 lesson.save(update_fields=["is_published", "updated_at"])
                 done += 1
@@ -138,10 +154,10 @@ class LessonAdmin(admin.ModelAdmin):
 
 @admin.register(Exercise)
 class ExerciseAdmin(admin.ModelAdmin):
-    list_display = ("lesson", "position", "exercise_type", "translation")
-    list_filter = ("exercise_type", "lesson__language")
-    list_select_related = ("lesson", "translation")
-    raw_id_fields = ("lesson", "translation")
+    list_display = ("lesson", "position", "exercise_type", "item")
+    list_filter = ("exercise_type", "lesson__course")
+    list_select_related = ("lesson", "item")
+    raw_id_fields = ("lesson", "item")
 
 
 # ------------------------------------------------------------ suivi élèves
@@ -186,7 +202,7 @@ class ReportAdmin(admin.ModelAdmin):
 class ContributionAdmin(admin.ModelAdmin):
     list_display = ("id", "language", "user", "status", "reviewer", "created_at")
     list_filter = ("status", "language")
-    raw_id_fields = ("user", "reviewer", "source")
+    raw_id_fields = ("user", "reviewer", "item")
 
 
 # ------------------------------------------------------------ gamification

@@ -1,5 +1,5 @@
 """
-apps/content/models.py  —  version complète et corrigée.
+content/models.py  —  version avec Item / Translation / Course (option B).
 
 ⚠ NE SUPPRIMEZ PAS MasterPhrase : c'est la table d'import brute.
   Si elle disparaît de ce fichier, `makemigrations` propose un DeleteModel
@@ -214,50 +214,34 @@ class DataSource(models.Model):
 
 
 # ============================================================
-# 5. PHRASES SOURCES (pivot arabe)
+# 5. ITEMS (unité d'apprentissage) — remplace SourceSentence
 # ============================================================
+# Un Item = une ligne d'origine de MasterPhrase (un mot ou une phrase).
+# Il ne contient AUCUN texte : les textes (arabe, français, hassaniya,
+# soninké...) sont des Translation rattachées à l'Item.
 
-class SourceSentence(models.Model):
+class Item(models.Model):
 
-    arabic_text = models.TextField()
-
-    # Unicité portée par l'empreinte (voir plus haut). Calculée dans save().
-    text_hash = models.CharField(max_length=64, unique=True, editable=False)
-
-    theme = models.ForeignKey(Theme, on_delete=models.PROTECT, related_name="source_sentences")
-
+    master_ref = models.CharField(max_length=64, blank=True, db_index=True)  # master_id d'origine
+    theme = models.ForeignKey(Theme, null=True, blank=True, on_delete=models.PROTECT, related_name="items")
     unit_type = models.CharField(max_length=20, choices=Level.choices, blank=True, default="")
-    word_count = models.PositiveIntegerField(default=0)
     difficulty = models.PositiveSmallIntegerField(
         default=1, validators=[MinValueValidator(1), MaxValueValidator(5)]
     )
-
+    # True = l'arabe et le français ne semblent pas dire la même chose : à relire.
+    needs_review = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["id"]
-        indexes = [
-            models.Index(fields=["theme", "difficulty"], name="src_theme_diff_idx"),
-        ]
-
-    def save(self, *args, **kwargs):
-        self.arabic_text = normalize_text(self.arabic_text)
-        self.text_hash = text_digest(arabic_key(self.arabic_text))
-        if not self.word_count:
-            self.word_count = len(self.arabic_text.split())
-        if not self.unit_type:
-            self.unit_type = estimate_unit_type(self.word_count)
-        fields = kwargs.get("update_fields")
-        if fields is not None and "arabic_text" in fields:
-            kwargs["update_fields"] = set(fields) | {"text_hash"}
-        super().save(*args, **kwargs)
+        indexes = [models.Index(fields=["theme", "difficulty"], name="item_theme_diff_idx")]
 
     def __str__(self):
-        return self.arabic_text[:80]
+        return self.master_ref or f"Item {self.pk}"
 
 
 # ============================================================
-# 6. TRADUCTIONS
+# 6. TRADUCTIONS (un texte dans une langue, rattaché à un Item)
 # ============================================================
 
 class Translation(models.Model):
@@ -267,11 +251,12 @@ class Translation(models.Model):
         VALIDATED = "validated", "Validée"
         FLAGGED = "flagged", "Signalée"
 
-    source = models.ForeignKey(SourceSentence, on_delete=models.PROTECT, related_name="translations")
+    item = models.ForeignKey(Item, on_delete=models.PROTECT, related_name="translations")
     language = models.ForeignKey(Language, on_delete=models.PROTECT, related_name="translations")
 
     text = models.TextField()
     text_hash = models.CharField(max_length=64, editable=False)
+    word_count = models.PositiveIntegerField(default=0, editable=False)
 
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.RAW)
 
@@ -285,8 +270,8 @@ class Translation(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["source", "language", "text_hash"],
-                name="uniq_trans_source_lang_hash",
+                fields=["item", "language", "text_hash"],
+                name="uniq_trans_item_lang_hash",
             )
         ]
         indexes = [
@@ -295,14 +280,47 @@ class Translation(models.Model):
 
     def save(self, *args, **kwargs):
         self.text = normalize_text(self.text)
-        self.text_hash = text_digest(translation_key(self.text))
+        # arabe : comparé sans voyelles brèves ; autres langues : sans la casse
+        if self.language.script == Language.Script.ARABIC:
+            key = arabic_key(self.text)
+        else:
+            key = translation_key(self.text)
+        self.text_hash = text_digest(key)
+        self.word_count = len(self.text.split())
         fields = kwargs.get("update_fields")
         if fields is not None and "text" in fields:
-            kwargs["update_fields"] = set(fields) | {"text_hash"}
+            kwargs["update_fields"] = set(fields) | {"text_hash", "word_count"}
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.language.code}: {self.text[:60]}"
+
+
+# ============================================================
+# 6 bis. COURS = (langue de départ, langue apprise)
+# ============================================================
+
+class Course(models.Model):
+    """Apprendre `target_language` à partir de `prompt_language`.
+    Ex. : français -> soninké. La langue de départ est celle de la QUESTION,
+    la langue apprise est celle des RÉPONSES."""
+
+    prompt_language = models.ForeignKey(Language, on_delete=models.PROTECT, related_name="courses_as_prompt")
+    target_language = models.ForeignKey(Language, on_delete=models.PROTECT, related_name="courses_as_target")
+    title = models.CharField(max_length=200)
+    is_active = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["prompt_language", "target_language"], name="uniq_course_pair"),
+            models.CheckConstraint(
+                condition=~models.Q(prompt_language=models.F("target_language")),
+                name="course_languages_differ",
+            ),
+        ]
+
+    def __str__(self):
+        return self.title
 
 
 # ============================================================
@@ -311,7 +329,7 @@ class Translation(models.Model):
 
 class Lesson(models.Model):
 
-    language = models.ForeignKey(Language, on_delete=models.PROTECT, related_name="lessons")
+    course = models.ForeignKey(Course, on_delete=models.PROTECT, related_name="lessons")
     theme = models.ForeignKey(Theme, on_delete=models.PROTECT, related_name="lessons")
 
     title = models.CharField(max_length=200)
@@ -325,11 +343,11 @@ class Lesson(models.Model):
     class Meta:
         # Tri explicite : trier sur une clé étrangère reprendrait le tri
         # du modèle lié et ajouterait des jointures à chaque requête.
-        ordering = ["language__code", "theme__position", "position", "id"]
+        ordering = ["course_id", "theme__position", "position", "id"]
         constraints = [
             models.UniqueConstraint(
-                fields=["language", "theme", "position"],
-                name="uniq_lesson_lang_theme_pos",
+                fields=["course", "theme", "position"],
+                name="uniq_lesson_course_theme_pos",
             )
         ]
 
@@ -344,13 +362,14 @@ class Lesson(models.Model):
 class Exercise(models.Model):
 
     class ExerciseType(models.TextChoices):
-        VOCAB = "vocab", "Vocabulaire"
+        VOCAB = "vocab", "Carte de présentation"
         MCQ = "mcq", "QCM"
         BUILD = "build", "Construction de phrase"
-        TRANSLATE = "translate", "Traduction"
+        CLOZE = "cloze", "Mot manquant"
+        TRANSLATE = "translate", "Traduction (saisie)"
 
     lesson = models.ForeignKey(Lesson, on_delete=models.CASCADE, related_name="exercises")
-    translation = models.ForeignKey(Translation, on_delete=models.PROTECT, related_name="exercises")
+    item = models.ForeignKey(Item, on_delete=models.PROTECT, related_name="exercises")
 
     exercise_type = models.CharField(max_length=20, choices=ExerciseType.choices)
 
@@ -365,22 +384,18 @@ class Exercise(models.Model):
 
     def clean(self):
         super().clean()
-        if self.lesson_id and self.translation_id:
+        if self.lesson_id and self.item_id:
             lesson = self.lesson
-            translation = self.translation
-
-            if lesson.language_id != translation.language_id:
-                raise ValidationError({
-                    "translation": "La langue de la traduction doit correspondre à celle de la leçon."
-                })
-            if lesson.theme_id != translation.source.theme_id:
-                raise ValidationError({
-                    "translation": "Le thème de la phrase source doit correspondre au thème de la leçon."
-                })
-            if lesson.is_published and translation.status != Translation.Status.VALIDATED:
-                raise ValidationError({
-                    "translation": "Une leçon publiée doit utiliser une traduction validée."
-                })
+            course = lesson.course
+            if not self.item.translations.filter(language_id=course.prompt_language_id).exists():
+                raise ValidationError({"item": "Cet élément n'a pas de texte dans la langue de départ du cours."})
+            target = self.item.translations.filter(language_id=course.target_language_id)
+            if not target.exists():
+                raise ValidationError({"item": "Cet élément n'a pas de texte dans la langue apprise."})
+            if lesson.theme_id != self.item.theme_id:
+                raise ValidationError({"item": "Le thème de l'élément doit correspondre à celui de la leçon."})
+            if lesson.is_published and not target.filter(status=Translation.Status.VALIDATED).exists():
+                raise ValidationError({"item": "Une leçon publiée doit utiliser une traduction validée."})
 
     def __str__(self):
         return f"{self.lesson.title} - Exercice {self.position}"
@@ -446,15 +461,10 @@ class Attempt(models.Model):
     def clean(self):
         super().clean()
         if self.exercise_id and self.translation_id:
-            if self.exercise.translation_id != self.translation_id:
+            if self.translation.item_id != self.exercise.item_id:
                 raise ValidationError({
-                    "translation": "La traduction doit être celle de l'exercice."
+                    "translation": "La traduction doit appartenir à l'élément de l'exercice."
                 })
-
-    def save(self, *args, **kwargs):
-        if self.exercise_id and not self.translation_id:
-            self.translation_id = self.exercise.translation_id
-        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"Tentative de {self.user}"
@@ -615,8 +625,8 @@ class Contribution(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="contributions")
     language = models.ForeignKey(Language, on_delete=models.PROTECT, related_name="contributions")
 
-    source = models.ForeignKey(
-        SourceSentence, null=True, blank=True, on_delete=models.SET_NULL, related_name="contributions"
+    item = models.ForeignKey(
+        Item, null=True, blank=True, on_delete=models.SET_NULL, related_name="contributions"
     )
 
     proposed_text = models.TextField()
